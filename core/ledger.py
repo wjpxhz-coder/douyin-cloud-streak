@@ -55,10 +55,16 @@ def _parse_streak(text) -> int:
     return int(m.group()) if m else 0
 
 
-def _norm_ws(s) -> str:
-    """空白归一化（仅用于 join 匹配，不改存储原样值）：
-    consumer 页显示名可能含不间断空格（U+00A0），creator 接口返回普通空格。"""
-    return str(s or "").replace("\u00a0", " ").strip()
+def norm_name(s: str | None) -> str:
+    """名称归一化：剔除不可见字符、NBSP、PUA 私有区字体图标编码、合并空白并去除两端空格。"""
+    s = str(s or "")
+    s = re.sub(r"[\u200b-\u200f\ufeff]", "", s)
+    s = re.sub(r"[\ue000-\uf8ff]|[\U000f0000-\U000ffffd]|[\U00100000-\U0010fffd]", "", s)
+    s = s.replace("\u00a0", " ").replace("\u3000", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_norm_ws = norm_name
 
 
 def load_ledger(account_id: str | None = None) -> list[dict]:
@@ -69,12 +75,36 @@ def load_ledger(account_id: str | None = None) -> list[dict]:
             try:
                 data = json.loads(lp.read_text(encoding="utf-8"))
                 if isinstance(data, list):
-                    entries = [dict(e) for e in data if isinstance(e, dict) and e.get("display_name")]
+                    raw_entries = [dict(e) for e in data if isinstance(e, dict) and norm_name(e.get("display_name"))]
+                    # 归一化与自动去重（修复旧数据中因不同空格/字体图标导致的重复条目）
+                    by_norm: dict[str, dict] = {}
+                    needs_resave = False
+                    for e in raw_entries:
+                        k = norm_name(e.get("display_name"))
+                        e["display_name"] = k
+                        if k in by_norm:
+                            needs_resave = True
+                            target = by_norm[k]
+                            # 合并条目数据：保留勾选、更高火花、有效头像与自定义文案
+                            if e.get("selected") and not target.get("selected"):
+                                target["selected"] = True
+                            if e.get("last_sent_at") and not target.get("last_sent_at"):
+                                target["last_sent_at"] = e.get("last_sent_at")
+                            if int(e.get("streak_days") or 0) > int(target.get("streak_days") or 0):
+                                target["streak_days"] = int(e.get("streak_days") or 0)
+                            if not target.get("avatar") and e.get("avatar"):
+                                target["avatar"] = e.get("avatar")
+                            if not target.get("custom_message") and e.get("custom_message"):
+                                target["custom_message"] = e.get("custom_message")
+                            if target.get("selected_order") is None and e.get("selected_order") is not None:
+                                target["selected_order"] = e.get("selected_order")
+                        else:
+                            by_norm[k] = e
+                    entries = list(by_norm.values())
+                    if needs_resave or len(entries) != len(raw_entries):
+                        _save(entries, account_id)
                     for e in entries:
                         # 派生标记（不持久化，读时计算保证一致）：
-                        # no_consumer_conversation：consumer 私信无会话（自动识别，不限来源）
-                        #   → 勾选也不会被通道 A 发送（默认 skipped 或降级），除非开启通道 B
-                        # creator_only：creator 页有记录 且 consumer 无会话（creator 来源子集）
                         e["no_consumer_conversation"] = not e.get("has_conversation")
                         e["creator_only"] = e.get("channel") == "creator" and e["no_consumer_conversation"]
             except Exception:
@@ -97,33 +127,47 @@ def _upsert(entries: list[dict], entry: dict) -> dict:
 
     新增条目补齐默认字段，保证 schema 一致。返回命中/新增的条目。
     """
+    target_name = norm_name(entry.get("display_name"))
+    entry["display_name"] = target_name
     for e in entries:
-        if e.get("display_name") == entry["display_name"]:
+        if norm_name(e.get("display_name")) == target_name:
             selected = e.get("selected", False)
             last_sent = e.get("last_sent_at")
+            order = e.get("selected_order")
+            custom_msg = e.get("custom_message", "")
             e.update(entry)
-            for k, v in _default_entry(entry["display_name"]).items():
+            for k, v in _default_entry(target_name).items():
                 e.setdefault(k, v)
             e["selected"] = selected
             e["last_sent_at"] = last_sent
+            if order is not None:
+                e["selected_order"] = order
+            if custom_msg and not e.get("custom_message"):
+                e["custom_message"] = custom_msg
             return e
-    base = _default_entry(entry["display_name"])
+    base = _default_entry(target_name)
     base.update(entry)
     entries.append(base)
     return base
 
 
 def merge_consumer_contacts(contacts: list[dict], account_id: str | None = None) -> dict:
-    """把 consumer 会话列表（fetch_chat_contacts 的 names 字段）upsert 进台账。
+    """把 consumer 会话列表（fetch_chat_contacts 的 names 字段）同步进台账。
 
-    只更新火花天数与会话存在性，不覆盖用户勾选与历史发送时间。
-    返回 {"added", "updated", "total"} 统计。
+    保证台账严格呈现最新获取的好友列表，自动剔除已不在列表中的旧联系人，彻底消除重复条目。
+    同时无缝保留已勾选状态、自定义文案、发送历史等用户配置。
+    返回 {"added", "updated", "removed", "total"} 统计。
     """
+    contacts = contacts or []
+    # 安全保护：如果获取结果为空，绝不清空现有台账，避免异常误删
+    if not contacts:
+        existing = load_ledger(account_id)
+        return {"added": 0, "updated": 0, "removed": 0, "total": len(existing)}
+
     # 步骤一：无锁读取快照用于头像比对
     with _lock:
         entries_snapshot = load_ledger(account_id)
-    by_name_snapshot = {e.get("display_name"): e for e in entries_snapshot}
-    contacts = contacts or []
+    by_name_snapshot = {norm_name(e.get("display_name")): e for e in entries_snapshot if norm_name(e.get("display_name"))}
 
     def _resolve_avatar(c: dict) -> str:
         """并发下载头像；无火花好友直接使用原链接不下载，大幅减轻并发封控压力。"""
@@ -132,14 +176,15 @@ def merge_consumer_contacts(contacts: list[dict], account_id: str | None = None)
             return ""
             
         streak = _parse_streak(c.get("streak"))
+        norm_c_name = norm_name(c.get("name"))
         if streak == 0:
-            old = by_name_snapshot.get(str(c.get("name", "")).strip())
+            old = by_name_snapshot.get(norm_c_name)
             return (old.get("avatar") or avatar_url) if old else avatar_url
 
         new_avatar = fetch_and_save_avatar(avatar_url, account_id)
         if new_avatar:
             return new_avatar
-        old = by_name_snapshot.get(str(c.get("name", "")).strip())
+        old = by_name_snapshot.get(norm_c_name)
         return (old.get("avatar") or avatar_url) if old else avatar_url
 
     # 步骤二：耗时网络 IO（完全不阻塞 _lock，前端 api 可畅通无阻）
@@ -147,47 +192,70 @@ def merge_consumer_contacts(contacts: list[dict], account_id: str | None = None)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         avatar_paths = list(pool.map(_resolve_avatar, contacts))
 
-    # 步骤三：拿锁，重新加载最新台账进行原子级 upsert
+    # 步骤三：拿锁，重新加载最新台账进行原子级同步构建
     with _lock:
-        entries = load_ledger(account_id)
-        by_name = {e.get("display_name"): e for e in entries}
+        existing_entries = load_ledger(account_id)
+        existing_by_norm = {norm_name(e.get("display_name")): e for e in existing_entries if norm_name(e.get("display_name"))}
+        
+        new_entries: list[dict] = []
+        seen_names: set[str] = set()
         added = 0
         updated = 0
         
         for c, avatar_path in zip(contacts, avatar_paths):
-            name = str(c.get("name", "")).strip()
-            if not name:
+            name = norm_name(c.get("name"))
+            if not name or name in seen_names:
                 continue
-            exists = name in by_name
-            old_entry = by_name.get(name) or {}
+            seen_names.add(name)
+            
+            old_entry = existing_by_norm.get(name) or {}
             old_avatar = old_entry.get("avatar") or ""
             new_streak = _parse_streak(c.get("streak"))
-            # 防数据污染：接口兜底/DOM 提取失败时 streak 为 0，绝不能用 0 回写
-            # 覆盖台账已有的精确火花；仅当新值在合理范围内才更新。
-            # 上限用 4 位数（9999）：抖音续火花可超过 999 天，但 5 位及以上
-            # 几乎必然是从消息文本误抠出的异常（金额/时间戳等），应予忽略。
+            
+            # 防数据污染：仅当新值在合理范围(1~9999)才更新，否则沿用旧值
             if 0 < new_streak <= 9999:
                 eff_streak = new_streak
             else:
                 eff_streak = int(old_entry.get("streak_days") or 0)
-            e = _upsert(entries, {
-                "display_name": name,
-                "streak_days": eff_streak,
-                "has_conversation": True,
-                "channel": "consumer",
-                "avatar": avatar_path or old_avatar,
-            })
-            e.setdefault("source", {})["consumer"] = True
-            if e.get("source", {}).get("creator") and e.get("nickname") == name:
-                e["join_confidence"] = "high"
-
-            if not exists:
-                added += 1
-            else:
+            
+            base = _default_entry(name)
+            if old_entry:
+                base.update(old_entry)
                 updated += 1
+            else:
+                added += 1
 
-        _save(entries, account_id)
-        return {"added": added, "updated": updated, "total": len(entries)}
+            base["display_name"] = name
+            base["streak_days"] = eff_streak
+            base["has_conversation"] = True
+            base["channel"] = "consumer"
+            base["avatar"] = avatar_path or old_avatar or c.get("avatar") or ""
+            base.setdefault("source", {})["consumer"] = True
+            if base.get("source", {}).get("creator") and norm_name(base.get("nickname")) == name:
+                base["join_confidence"] = "high"
+
+            new_entries.append(base)
+
+        # 保留非 consumer 的合法条目（如 creator 专属拓展好友或手动添加的勾选好友）
+        removed = 0
+        for old in existing_entries:
+            k = norm_name(old.get("display_name"))
+            if k in seen_names:
+                continue
+            # creator 独有条目保留
+            if old.get("channel") == "creator" and not old.get("source", {}).get("consumer"):
+                new_entries.append(old)
+                seen_names.add(k)
+            # 用户手动添加且勾选的好友保留
+            elif old.get("channel") == "none" and old.get("selected"):
+                new_entries.append(old)
+                seen_names.add(k)
+            else:
+                # 旧的未再出现的 consumer 联系人被成功剔除
+                removed += 1
+
+        _save(new_entries, account_id)
+        return {"added": added, "updated": updated, "removed": removed, "total": len(new_entries)}
 
 
 def import_config_friends(friends: list[str], account_id: str | None = None) -> dict:
@@ -199,11 +267,11 @@ def import_config_friends(friends: list[str], account_id: str | None = None) -> 
     """
     with _lock:
         entries = load_ledger(account_id)
-        by_name = {e.get("display_name"): e for e in entries}
+        by_name = {norm_name(e.get("display_name")): e for e in entries if norm_name(e.get("display_name"))}
         added = 0
         selected = 0
         for name in friends or []:
-            name = str(name).strip()
+            name = norm_name(name)
             if not name:
                 continue
             if name in by_name:
@@ -211,12 +279,13 @@ def import_config_friends(friends: list[str], account_id: str | None = None) -> 
                     by_name[name]["selected"] = True
                     selected += 1
             else:
-                entries.append({
+                new_e = {
                     **_default_entry(name),
                     "has_conversation": False,
                     "selected": True,
-                })
-                by_name[name] = entries[-1]
+                }
+                entries.append(new_e)
+                by_name[name] = new_e
                 added += 1
         if added or selected:
             _save(entries, account_id)
@@ -235,10 +304,11 @@ def set_streak(name: str, days: int, account_id: str | None = None) -> bool:
     """
     if not isinstance(days, int) or isinstance(days, bool) or not (0 < days <= 9999):
         return False
+    target = norm_name(name)
     with _lock:
         entries = load_ledger(account_id)
         for e in entries:
-            if e.get("display_name") == name:
+            if norm_name(e.get("display_name")) == target:
                 e["streak_days"] = days
                 _save(entries, account_id)
                 return True
@@ -352,13 +422,14 @@ def confirm_join(display_name: str, account_id: str | None = None) -> None:
     标记 source.consumer=true、channel=consumer；若 nickname == display_name（两侧名字一致）
     → join_confidence 升级为 high。
     """
+    target = norm_name(display_name)
     with _lock:
         entries = load_ledger(account_id)
         for e in entries:
-            if e.get("display_name") == display_name:
+            if norm_name(e.get("display_name")) == target:
                 e.setdefault("source", {})["consumer"] = True
                 e["channel"] = "consumer"
-                if e.get("nickname") and e["nickname"] == display_name:
+                if norm_name(e.get("nickname")) == target:
                     e["join_confidence"] = "high"
                 break
         _save(entries, account_id)
@@ -366,11 +437,12 @@ def confirm_join(display_name: str, account_id: str | None = None) -> None:
 
 def set_custom_message(display_name: str, message: str, account_id: str | None = None) -> bool:
     """设置指定好友的专属发送文案（传空字符串则表示清除专属文案，跟随全局文案库）。"""
+    target = norm_name(display_name)
     with _lock:
         entries = load_ledger(account_id)
         found = False
         for e in entries:
-            if e.get("display_name") == display_name:
+            if norm_name(e.get("display_name")) == target:
                 e["custom_message"] = str(message or "").strip()
                 found = True
                 break
@@ -389,11 +461,11 @@ def set_selected(entries_in: list[dict], account_id: str | None = None) -> dict:
     """
     with _lock:
         entries = load_ledger(account_id)
-        by_name = {e.get("display_name"): e for e in entries}
+        by_name = {norm_name(e.get("display_name")): e for e in entries if norm_name(e.get("display_name"))}
         updated = 0
         added = 0
         for it in entries_in:
-            name = str(it.get("display_name", "")).strip()
+            name = norm_name(it.get("display_name", ""))
             sel = bool(it.get("selected"))
             order = it.get("selected_order")
             if not name:
@@ -413,14 +485,15 @@ def set_selected(entries_in: list[dict], account_id: str | None = None) -> dict:
                         e["custom_message"] = c_msg
                         updated += 1
             else:
-                entries.append({
+                new_e = {
                     **_default_entry(name),
                     "has_conversation": False,
                     "selected": sel,
                     "selected_order": order if sel else None,
                     "custom_message": str(it.get("custom_message") or "").strip(),
-                })
-                by_name[name] = entries[-1]
+                }
+                entries.append(new_e)
+                by_name[name] = new_e
                 added += 1
         if updated or added:
             _save(entries, account_id)

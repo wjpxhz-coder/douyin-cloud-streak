@@ -1560,19 +1560,37 @@
 
         const loadLedger = async () => {
           try {
-            const res = await api.get('/api/ledger');
+            const res = await api.get('/api/ledger', { params: { account_id: currentAccountId.value } });
             const list = res.data.contacts || res.data.entries || [];
-            contacts.value = list.map(item => ({
-              display_name: item.display_name || item.nickname || '',
-              nickname: item.nickname || item.display_name || '',
-              avatar: item.avatar || '',
-              custom_message: item.custom_message || '',
-              spark_days: Number(item.spark_days || item.streak_days || 0),
-              streak_days: Number(item.streak_days || item.spark_days || 0),
-              selected: Boolean(item.selected),
-              last_status: item.last_status || (item.last_sent_at ? 'success' : 'pending'),
-              last_sent_at: item.last_sent_at || ''
-            }));
+            const dedupMap = new Map();
+            for (const item of list) {
+              const name = (item.display_name || item.nickname || '').trim();
+              if (!name) continue;
+              const spark = Number(item.spark_days || item.streak_days || 0);
+              const existing = dedupMap.get(name);
+              if (existing) {
+                if (item.selected) existing.selected = true;
+                if (spark > existing.spark_days) {
+                  existing.spark_days = spark;
+                  existing.streak_days = spark;
+                }
+                if (!existing.avatar && item.avatar) existing.avatar = item.avatar;
+                if (!existing.custom_message && item.custom_message) existing.custom_message = item.custom_message;
+              } else {
+                dedupMap.set(name, {
+                  display_name: name,
+                  nickname: item.nickname || name,
+                  avatar: item.avatar || '',
+                  custom_message: item.custom_message || '',
+                  spark_days: spark,
+                  streak_days: spark,
+                  selected: Boolean(item.selected),
+                  last_status: item.last_status || (item.last_sent_at ? 'success' : 'pending'),
+                  last_sent_at: item.last_sent_at || ''
+                });
+              }
+            }
+            contacts.value = Array.from(dedupMap.values());
             if (res.data.last_run) {
               lastRunInfo.time = res.data.last_run.time || '';
               lastRunInfo.summary = res.data.last_run.summary || '';
