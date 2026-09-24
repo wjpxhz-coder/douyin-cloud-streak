@@ -36,9 +36,7 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _norm_name(s) -> str:
-    """昵称归一化：NBSP/零宽字符剔除 + trim，用于精确比对防止错发。"""
-    return str(s or "").replace("\u00a0", " ").replace("\u200b", "").strip()
+_norm_name = ledger.norm_name
 
 
 # 火花天数字段名候选（接口层）：抖音后端字段名比前端混淆类名稳定得多，
@@ -613,11 +611,17 @@ _EXTRACT_JS = r"""
             if (!name) {
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll(
-                    '[class*="TagNextToTitle"], [class*="timeStr"], [class*="streak"], [class*="Streak"], [class*="badge"]'
+                    '[class*="TagNextToTitle"], [class*="timeStr"], [class*="streak"], [class*="Streak"], [class*="badge"], svg, [class*="icon"]'
                 ).forEach(x => x.remove());
                 name = (clone.textContent || "").trim();
             }
-            return name.replace(/\\s+/g, " ").trim();
+            // 剔除不可见字符、NBSP、PUA 私有区字体图标编码、合并空白
+            name = name.replace(/[\u00a0\u3000]/g, " ")
+                       .replace(/[\u200b-\u200f\ufeff]/g, "")
+                       .replace(/[\uE000-\uF8FF]|[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "")
+                       .replace(/\s+/g, " ")
+                       .trim();
+            return name;
         };
 
         rows.forEach(row => {
@@ -893,7 +897,7 @@ def _scroll_and_extract(page, collected: list[dict], max_rounds: int = 80) -> No
     - 每轮等待缩短，滚动步长自适应：底部剩余不足时取剩余距离，避免无效滚动。
     """
     _dismiss_dialogs(page)
-    seen = {c.get("name") for c in collected}
+    seen = {_norm_name(c.get("name")) for c in collected if _norm_name(c.get("name"))}
     stable = 0
     last_bottom = False
 
@@ -902,9 +906,10 @@ def _scroll_and_extract(page, collected: list[dict], max_rounds: int = 80) -> No
         data = res.get("items") or []
         new_items = []
         for x in data:
-            name = x.get("name")
+            name = _norm_name(x.get("name"))
             if name and name not in seen:
                 seen.add(name)
+                x["name"] = name
                 new_items.append(x)
         if new_items:
             collected.extend(new_items)
@@ -1056,16 +1061,34 @@ def fetch_chat_contacts(account_id: str | None = None) -> dict:
             # 接口补充：DOM 漏掉的最新会话好友并入（去重）；DOM 有同名但火花为空的，
             # 用接口探测到的火花值回填（接口字段比前端混淆类名稳定，最通用）。
             if collected and api_names:
-                by_name = {c.get("name"): c for c in collected}
+                by_name = {_norm_name(c.get("name")): c for c in collected if _norm_name(c.get("name"))}
                 for n in api_names:
-                    cur = by_name.get(n.get("name"))
+                    k = _norm_name(n.get("name"))
+                    if not k:
+                        continue
+                    cur = by_name.get(k)
                     if cur is None:
+                        n["name"] = k
+                        by_name[k] = n
                         collected.append(n)
-                    elif not cur.get("streak") and n.get("streak"):
-                        cur["streak"] = n.get("streak")
-                logger.info("接口补充 %s 条昵称（共 %s 条）", len(api_names) - sum(1 for n in api_names if n["name"] in by_name), len(collected))
+                    else:
+                        if not cur.get("streak") and n.get("streak"):
+                            cur["streak"] = n.get("streak")
+                        if not cur.get("avatar") and n.get("avatar"):
+                            cur["avatar"] = n.get("avatar")
+                logger.info("接口补充 %s 条昵称（共 %s 条）", len(api_names) - sum(1 for n in api_names if _norm_name(n.get("name")) in by_name), len(collected))
 
-            result["names"] = collected
+            # 全面清洗与保序去重，确保进入结果集的联系人绝对规范无重复
+            cleaned_names: list[dict] = []
+            final_seen: set[str] = set()
+            for c in collected:
+                k = _norm_name(c.get("name"))
+                if not k or k in final_seen:
+                    continue
+                final_seen.add(k)
+                cleaned_names.append({**c, "name": k})
+
+            result["names"] = cleaned_names
             logger.info("已读取聊天列表联系人 %s 个", len(result["names"]))
             if collected:
                 sample = [(c.get("name"), c.get("streak")) for c in collected[:5]]

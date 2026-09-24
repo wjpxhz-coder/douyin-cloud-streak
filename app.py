@@ -217,8 +217,8 @@ def _start_fetch_contacts(account_id: str) -> None:
                 record_contacts(data, aid)
                 if data.get("names"):
                     stats = ledger.merge_consumer_contacts(data["names"], aid)
-                    logger.info("[%s] 台账已同步：新增 %s 人，更新 %s 人，共 %s 人",
-                                aid, stats["added"], stats["updated"], stats["total"])
+                    logger.info("[%s] 台账已同步为最新列表：新增 %s 人，更新 %s 人，清理旧联系人 %s 人，共 %s 人",
+                                aid, stats.get("added", 0), stats.get("updated", 0), stats.get("removed", 0), stats.get("total", 0))
             finally:
                 contacts_fetching.discard(aid)
         finally:
