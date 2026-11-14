@@ -1859,8 +1859,10 @@
         };
 
         const pollLoginStatus = async () => {
+          const seq = qrSessionSeq;
           try {
             const res = await api.get('/api/login/status');
+            if (seq !== qrSessionSeq || !qrDialogVisible.value) return;
             loginState.value = res.data;
             if (!LOGIN_BUSY_STATES.includes(res.data.status)) {
               stopLoginPolling();
