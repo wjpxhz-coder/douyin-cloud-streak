@@ -83,15 +83,66 @@ def _reclaim(entry: dict) -> None:
             pass
 
 
-def _reap_idle(now: float) -> None:
-    """惰性回收所有空闲超时的实例（须在工作线程内调用）。"""
+def _pop_idle_locked(now: float, force: bool = False) -> list[dict]:
+    """在持有 _POOL_LOCK 的前提下弹出可回收的空闲条目。"""
+    idle_entries: list[dict] = []
     for key in list(_BROWSER_POOL.keys()):
         e = _BROWSER_POOL.get(key)
-        if not e:
+        if not e or e.get("refs", 0) != 0:
             continue
-        if e.get("refs", 0) == 0 and now - e.get("last_used", 0) > POOL_IDLE_TIMEOUT:
+        if force or now - e.get("last_used", 0) > POOL_IDLE_TIMEOUT:
             _BROWSER_POOL.pop(key, None)
-            _reclaim(e)
+            idle_entries.append(e)
+    return idle_entries
+
+
+def _reap_idle(now: float) -> None:
+    """惰性回收所有空闲超时的实例（须在工作线程内调用）。"""
+    for e in _pop_idle_locked(now, force=False):
+        _reclaim(e)
+
+
+def reap_idle_now(force: bool = False, now: float | None = None) -> int:
+    """回收空闲浏览器实例（须在 executor 工作线程内调用）。"""
+    ts = time.time() if now is None else now
+    with _POOL_LOCK:
+        entries = _pop_idle_locked(ts, force=force)
+    for e in entries:
+        _reclaim(e)
+    if entries:
+        logger.info("已回收 %d 个空闲浏览器实例释放内存", len(entries))
+    return len(entries)
+
+
+def reclaim_idle_from_executor(force: bool = True, timeout: float = 2.5) -> int:
+    """跨线程安全请求 executor 回收空闲浏览器，避免扫码启动时双开浏览器耗尽内存。"""
+    if not _POOL_LOCK.acquire(timeout=min(0.4, max(0.05, timeout))):
+        logger.debug("浏览器池锁繁忙（工作线程可能正在冷启动），跳过前置回收")
+        return 0
+    try:
+        has_idle = any(e and e.get("refs", 0) == 0 for e in _BROWSER_POOL.values())
+    finally:
+        _POOL_LOCK.release()
+    if not has_idle:
+        return 0
+    from .executor import executor
+
+    cancelled = threading.Event()
+
+    def _task() -> int:
+        if cancelled.is_set():
+            return 0
+        return reap_idle_now(force=force)
+
+    try:
+        return int(executor.submit_and_wait(_task, timeout=timeout) or 0)
+    except TimeoutError:
+        cancelled.set()
+        logger.debug("请求 executor 回收空闲浏览器超时，跳过以免阻塞扫码启动")
+        return 0
+    except Exception as e:
+        logger.debug("回收空闲浏览器失败（已忽略）: %s", e)
+        return 0
 
 
 def _new_pool_entry() -> dict:
@@ -112,8 +163,9 @@ def shutdown_pool() -> None:
     for e in entries:
         _reclaim(e)
     global _PW
-    pw = _PW
-    _PW = None
+    with _PW_LOCK:
+        pw = _PW
+        _PW = None
     if pw:
         try:
             pw.stop()

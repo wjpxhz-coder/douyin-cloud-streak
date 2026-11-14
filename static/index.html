@@ -1227,16 +1227,34 @@
         为账号 <strong>{{ currentAccount.name }}</strong> 登录抖音。请打开手机抖音 App → 扫一扫，扫描下方二维码并确认登录。
       </div>
 
-      <div style="display: flex; flex-direction: column; align-items: center; gap: 12px;">
+      <div style="display: flex; flex-direction: column; align-items: center; gap: 12px;" aria-live="polite">
+        <div v-if="loginState.phase === 'second_verify_qr'" style="font-size: 12px; color: #b45309; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 6px; padding: 6px 10px; line-height: 1.5;">
+          ⚠️ 触发账号安全验证，请立即用手机抖音扫描下方<strong>新二维码</strong>
+        </div>
+
         <div v-if="loginState.qrcode" style="padding: 10px; background: #fff; border: 1px solid var(--border-color); border-radius: var(--radius-sm); line-height: 0;">
           <img :src="loginState.qrcode" alt="登录二维码" style="width: 220px; height: 220px; object-fit: contain;" />
+        </div>
+        <div v-else-if="loginState.phase === 'scanned' && isLoginBusy" style="width: 240px; height: 240px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; background: #f0fdf4; border: 1px solid #86efac; border-radius: var(--radius-sm); padding: 16px;">
+          <div style="font-size: 32px; color: #16a34a;">✓</div>
+          <div style="font-size: 14px; font-weight: 600; color: #15803d;">已在手机端扫码</div>
+          <div style="font-size: 12.5px; color: var(--text-muted); line-height: 1.5;">
+            请在{{ loginState.scan_device ? `「${loginState.scan_device}」` : '手机' }}抖音 App 上点击「确认登录」
+          </div>
+        </div>
+        <div v-else-if="loginState.phase === 'confirmed' && isLoginBusy" v-loading="true" style="width: 240px; height: 240px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: #eff6ff; border: 1px solid #93c5fd; border-radius: var(--radius-sm); padding: 16px;">
+          <div style="font-size: 13.5px; font-weight: 600; color: #1d4ed8; margin-top: 56px;">手机已确认，正在同步凭证…</div>
+        </div>
+        <div v-else-if="loginState.status === 'success'" style="width: 240px; height: 240px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; background: #f0fdf4; border: 1px solid #86efac; border-radius: var(--radius-sm);">
+          <div style="font-size: 36px; color: #16a34a;">✓</div>
+          <div style="font-size: 14px; font-weight: 600; color: #15803d;">登录成功！</div>
         </div>
         <div v-else-if="isLoginBusy" v-loading="true" style="width: 240px; height: 240px; display: flex; align-items: center; justify-content: center; background: var(--bg-surface-subtle); border-radius: var(--radius-sm);">
         </div>
 
-        <div style="font-size: 13.5px; font-weight: 600;">
+        <div style="font-size: 13.5px; font-weight: 600; line-height: 1.6;">
           {{ loginState.message || '等待中…' }}
-          <span v-if="loginState.status === 'waiting_scan'" style="color: #16a34a;">（等待扫码确认）</span>
+          <span v-if="loginPhaseBadge" :style="{ color: loginState.phase === 'second_verify_qr' ? '#d97706' : '#16a34a' }">{{ loginPhaseBadge }}</span>
         </div>
         <div v-if="loginState.deep_link && isSafeDeepLink && loginState.status === 'waiting_scan'" style="margin-top: 4px;">
           <a :href="loginState.deep_link" target="_blank" rel="noopener noreferrer" style="text-decoration: none;">
@@ -1250,8 +1268,9 @@
       </div>
 
       <template #footer>
-        <div style="display: flex; gap: 8px; justify-content: center;">
-          <el-button v-if="!isLoginBusy" type="primary" class="btn-action-primary" @click="startQrLogin">重新获取二维码</el-button>
+        <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+          <el-button v-if="!isLoginBusy && loginState.status !== 'success'" type="primary" class="btn-action-primary" @click="startQrLogin">重新获取二维码</el-button>
+          <el-button v-if="!isLoginBusy && loginState.status !== 'success'" @click="triggerUploadFromQrDialog">上传 state.json</el-button>
           <el-button @click="qrDialogVisible = false">{{ isLoginBusy ? '取消' : '关闭' }}</el-button>
         </div>
       </template>
@@ -1811,8 +1830,9 @@
 
         // ── 网页扫码登录 ──
         const LOGIN_BUSY_STATES = ['queuing', 'starting', 'waiting_scan'];
+        const fileInput = ref(null);
         const qrDialogVisible = ref(false);
-        const loginState = ref({ status: 'idle', message: '', qrcode: '', deep_link: '', error: '' });
+        const loginState = ref({ status: 'idle', phase: 'idle', message: '', qrcode: '', deep_link: '', scan_device: '', error: '' });
         // 深链只放行 https 与抖音官方 App scheme，防止 javascript:/data: 等危险协议注入
         const isSafeDeepLink = computed(() => {
           const v = String(loginState.value.deep_link || '');
@@ -1821,6 +1841,18 @@
         let loginPollTimer = null;
 
         const isLoginBusy = computed(() => LOGIN_BUSY_STATES.includes(loginState.value.status));
+
+        const loginPhaseBadge = computed(() => {
+          if (loginState.value.status !== 'waiting_scan') return '';
+          const map = {
+            qr_ready: '（等待扫码）',
+            qr_refreshed: '（已自动刷新）',
+            scanned: '（已扫码 · 待手机确认）',
+            confirmed: '（已确认 · 同步凭证中）',
+            second_verify_qr: '（二次安全验证 · 请扫新码）',
+          };
+          return map[loginState.value.phase] || '（等待扫码确认）';
+        });
 
         const stopLoginPolling = () => {
           if (loginPollTimer) { clearInterval(loginPollTimer); loginPollTimer = null; }
@@ -1843,20 +1875,34 @@
           } catch (e) { /* 轮询失败静默，下个周期重试 */ }
         };
 
+        let qrSessionSeq = 0;
+
         const startLoginPolling = () => {
           stopLoginPolling();
           pollLoginStatus();
-          loginPollTimer = setInterval(pollLoginStatus, 1500);
+          loginPollTimer = setInterval(pollLoginStatus, 1000);
         };
 
         const startQrLogin = async () => {
-          loginState.value = { status: 'queuing', message: '正在排队获取浏览器名额…', qrcode: '', error: '' };
+          const seq = ++qrSessionSeq;
+          loginState.value = { status: 'queuing', phase: 'queuing', message: '正在排队获取浏览器名额…', qrcode: '', deep_link: '', scan_device: '', error: '' };
           try {
             await api.post('/api/login/start');
+            if (seq !== qrSessionSeq || !qrDialogVisible.value) {
+              if (!qrDialogVisible.value) { api.post('/api/login/cancel').catch(() => {}); }
+              return;
+            }
             startLoginPolling();
           } catch (e) {
-            loginState.value = { status: 'failed', message: '发起扫码失败', qrcode: '', error: e.response?.data?.detail || e.message };
+            if (seq !== qrSessionSeq) return;
+            loginState.value = { status: 'failed', phase: 'failed', message: '发起扫码失败', qrcode: '', deep_link: '', scan_device: '', error: e.response?.data?.detail || e.message };
           }
+        };
+
+        const triggerUploadFromQrDialog = () => {
+          qrDialogVisible.value = false;
+          tab.value = 'credentials';
+          if (fileInput.value) fileInput.value.click();
         };
 
         const goToCredentials = () => {
@@ -1885,10 +1931,11 @@
         };
 
         const cancelLoginPolling = async () => {
+          qrSessionSeq++;
           stopLoginPolling();
           if (isLoginBusy.value) {
             try { await api.post('/api/login/cancel'); } catch (e) { /* ignore */ }
-            loginState.value = { status: 'cancelled', message: '已取消', qrcode: '', error: '' };
+            loginState.value = { status: 'cancelled', phase: 'cancelled', message: '已取消', qrcode: '', deep_link: '', scan_device: '', error: '' };
           }
         };
 
@@ -2000,10 +2047,13 @@
           fetchLogs,
           clearLogs,
           handleFileUpload,
+          fileInput,
           qrDialogVisible,
           loginState,
           isSafeDeepLink,
           isLoginBusy,
+          loginPhaseBadge,
+          triggerUploadFromQrDialog,
           openQrLogin,
           startQrLogin,
           cancelLoginPolling,
