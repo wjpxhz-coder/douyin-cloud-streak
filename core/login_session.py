@@ -601,7 +601,8 @@ class _LoginNetworkTracker:
     def _ingest_response_data(
         self, url: str, http_status: int, headers: dict, payload: dict | None
     ) -> None:
-        url_l = (url or "").lower()
+        # 仅基于去掉 query/fragment 的基础 URL 判定端点类型，防止 ?verifyFp=... 或 ?next=... 误入二次验证分支
+        url_base = (url or "").split("?", 1)[0].split("#", 1)[0].lower()
         now = time.time()
         vconf = _parse_verify_config(headers, payload)
 
@@ -613,9 +614,9 @@ class _LoginNetworkTracker:
                 return
 
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-            is_safe_endpoint = "/passport/safe/" in url_l or "second" in url_l or "verify" in url_l
+            is_safe_endpoint = "/passport/safe/" in url_base or "second" in url_base or "verify" in url_base
 
-            if "get_qrcode" in url_l:
+            if "get_qrcode" in url_base:
                 qr = str(data.get("qrcode") or payload.get("qrcode") or "").strip()
                 dl = str(data.get("qrcode_index_url") or payload.get("qrcode_index_url") or "").strip()
                 tok = str(data.get("token") or payload.get("token") or "").strip()
@@ -631,7 +632,7 @@ class _LoginNetworkTracker:
                         self._pending_qr = (qr, dl, "get_qrcode")
                 return
 
-            if "check_qrconnect" in url_l:
+            if "check_qrconnect" in url_base:
                 raw_status = str(data.get("status", "")).strip().lower()
                 mapped = _QR_STATUS_MAP.get(raw_status)
                 qr = str(data.get("qrcode") or "").strip()
@@ -1482,8 +1483,12 @@ def _poll_until_login(
 
         skip_qr_sync = _handle_secondary_verification(aid, page, dom, snap, state)
 
-        # 仅在非二次验证、且网络未处于已扫码/已确认态时同步过期刷新与静默换码
-        if not skip_qr_sync and state["phase"] != "second_verify_qr" and snap["qr_status"] not in ("scanned", "confirmed"):
+        # 仅在非已扫码/已确认/二次验证态时同步过期刷新与静默换码
+        if (
+            not skip_qr_sync
+            and state["phase"] not in ("scanned", "confirmed", "second_verify_qr")
+            and snap["qr_status"] not in ("scanned", "confirmed")
+        ):
             if dom.get("loginQrExpired") or snap["qr_needs_manual_refresh"]:
                 tracker.clear_manual_refresh_flag()
                 state["manual_refreshes"] += 1
@@ -1705,7 +1710,9 @@ def _session_worker(aid: str, stop_flag: threading.Event, st: dict | None = None
                     _sessions.pop(aid, None)
                     logger.debug("[%s] 历史扫码会话已安全 GC 清理", aid)
 
-        threading.Timer(120, lambda: _gc_session(st)).start()
+        gc_timer = threading.Timer(120, lambda: _gc_session(st))
+        gc_timer.daemon = True
+        gc_timer.start()
 
 
 def _save_state(context, account_id: str) -> None:

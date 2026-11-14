@@ -1047,6 +1047,77 @@ class LoginSessionFixTests(unittest.TestCase):
         finally:
             _cleanup_session(aid2)
 
+    def test_verifyfp_query_param_not_misclassified_and_dom_scanned_suppresses_refresh(self) -> None:
+        # 1) 携带 ?verifyFp= 与 ?next=...second... 参数的主登录接口不得被误判为二次安全验证端点
+        tracker = ls._LoginNetworkTracker()
+        qr_primary = _make_qr_b64(25)
+        tracker._ingest_response_data(
+            "https://sso.douyin.com/get_qrcode/?verifyFp=verify_abc123&next=second_page",
+            200,
+            {},
+            {"data": {"qrcode": qr_primary, "qrcode_index_url": "https://www.douyin.com/dl_vp"}},
+        )
+        self.assertTrue(tracker.snapshot()["saw_qr_api"])
+        self.assertIsNone(tracker.pop_pending_second_qr())
+        self.assertEqual(
+            tracker.pop_pending_qr(),
+            (qr_primary, "https://www.douyin.com/dl_vp", "get_qrcode"),
+        )
+
+        tracker._ingest_response_data(
+            "https://sso.douyin.com/check_qrconnect/?verifyFp=verify_abc123&service=https%3A%2F%2Fwww.douyin.com",
+            200,
+            {},
+            {"data": {"status": "2", "scan_device_info": {"device_name": "iPhone 15"}}},
+        )
+        self.assertEqual(tracker.snapshot()["qr_status"], "scanned")
+        self.assertEqual(tracker.snapshot()["scan_device"], "iPhone 15")
+
+        tracker._ingest_response_data(
+            "https://sso.douyin.com/check_qrconnect/?verifyFp=verify_abc123",
+            200,
+            {},
+            {"data": {"status": "3"}},
+        )
+        self.assertEqual(tracker.snapshot()["qr_status"], "confirmed")
+
+        # 2) DOM 先于网络检测到已扫码头像时，即使同期伴随 loginQrExpired 也不得触发刷新覆盖 scanned 态
+        aid = "test_dom_scanned_no_refresh"
+        _setup_session(aid, qr_b64=qr_primary)
+        try:
+            ctx = _FakeContext()
+            t2 = ls._LoginNetworkTracker()
+            dom_scanned = {
+                **ls._empty_dom_inspection(),
+                "scannedText": "小蛇 已扫码",
+                "loginQrExpired": True,
+            }
+
+            def on_tick(tick: int) -> None:
+                if tick == 1:
+                    ctx.cookie_list.append({"name": "sessionid", "value": "dom_scan_ok", "domain": ".douyin.com"})
+
+            page = _FakePage(on_tick=on_tick)
+            with (
+                mock.patch.object(ls, "_inspect_all_frames", return_value=dom_scanned),
+                mock.patch.object(ls, "_click_qr_refresh") as refresh_mock,
+                mock.patch.object(ls, "_save_state") as save_mock,
+            ):
+                ls._poll_until_login(
+                    aid,
+                    ctx,
+                    page,
+                    t2,
+                    ls._stop_flags[aid],
+                    initial_qr_fp=ls._qr_fingerprint(qr_primary),
+                    initial_qr=f"data:image/png;base64,{qr_primary}",
+                )
+            refresh_mock.assert_not_called()
+            save_mock.assert_called_once()
+            self.assertEqual(ls.status(aid)["status"], "success")
+        finally:
+            _cleanup_session(aid)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
